@@ -78,6 +78,7 @@ OPENAI_VOICES = ["coral", "alloy", "ash", "ballad", "echo", "fable", "nova", "on
 STT_MODELS = ["gpt-4o-mini-transcribe", "gpt-4o-transcribe", "whisper-1"]
 LLM_MODELS = ["gpt-4o-mini", "gpt-4.1-mini", "gpt-4o"]
 GEMINI_LLMS = ["gemini-4-hydrogen", "gemini-3.8-flash", "gemini-3.6-flash"]  # gemini-4-hydrogen is the model in Google's own chat, audio and function-calling examples
+GEMINI_STT = ["gemini-4-hydrogen", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite", "gemini-3.8-flash", "gemini-3.6-flash"]  # general models with audio input; first is the one in Google's audio examples
 GEMINI_TTS = ["gemini-3.8-flash-lite-tts", "gemini-3.8-flash-tts"]
 GEMINI_VOICES = ["Kore", "Puck", "Zephyr", "Charon", "Fenrir", "Leda"]
 
@@ -225,6 +226,8 @@ def check(r):
         hint = "Bad request. Check the model name is available to this key and the request is valid."
     elif r.status_code == 404:
         hint = "Model not available to this key/project."
+    elif r.status_code in (500, 502, 503, 504):
+        hint = ("Temporary overload or outage on the provider's side, not a problem with your key or audio. The app does not retry for you. Wait" + (f" at least {r.headers.get('retry-after')} seconds" if r.headers.get("retry-after") else " a minute") + ", then try once more by hand. If it keeps failing, pick a different model in the sidebar (Speech-to-Text > Model) and retry once.")
     ra = r.headers.get("retry-after")
     raise RuntimeError(f"HTTP {r.status_code} from {who}" + (f" | code: {code}" if code else "") + (f" | type: {typ}" if typ else "") + (f" | message: {msg}" if msg else "") + (f" | retry-after: {ra}s" if ra else "") + (f" | request id: {rid}" if rid else "") + (f" | {hint}" if hint else ""))
 
@@ -915,7 +918,7 @@ with st.sidebar:
         stt_engine = st.radio("Engine", engines)
         if not HAS_LOCAL_WHISPER:
             st.caption("Local Whisper is not available on this hosted app.")
-        stt_model = st.selectbox("Model", GEMINI_LLMS if provider == "Gemini" else STT_MODELS, help="Gemini transcribes audio with a general Gemini model (prompted for a transcript)." if provider == "Gemini" else None)
+        stt_model = st.selectbox("Model", GEMINI_STT if provider == "Gemini" else STT_MODELS, help="This picks the speech-to-text (microphone) model. Gemini transcribes with a general model, prompted for a transcript. The TTS model (voice) is a separate selector further down. If a model is overloaded (503), wait and retry once or choose another." if provider == "Gemini" else None)
         language = st.selectbox("Language", ["Auto-detect", "English (en)", "Hindi (hi)", "Bengali (bn)", "Spanish (es)", "French (fr)", "German (de)"])
         vocab = st.text_input("Domain vocabulary (spelling hints)", placeholder="Vistra, KYC, ORD-1002, Harbourfront")
     with st.expander("🎚️ Audio front-end"):
