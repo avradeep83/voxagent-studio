@@ -77,7 +77,7 @@ FAQ = {
 OPENAI_VOICES = ["coral", "alloy", "ash", "ballad", "echo", "fable", "nova", "onyx", "sage", "shimmer", "verse"]
 STT_MODELS = ["gpt-4o-mini-transcribe", "gpt-4o-transcribe", "whisper-1"]
 LLM_MODELS = ["gpt-4o-mini", "gpt-4.1-mini", "gpt-4o"]
-GEMINI_LLMS = ["gemini-3.8-flash", "gemini-3.6-flash"]
+GEMINI_LLMS = ["gemini-4-hydrogen", "gemini-3.8-flash", "gemini-3.6-flash"]  # gemini-4-hydrogen is the model in Google's own chat, audio and function-calling examples
 GEMINI_TTS = ["gemini-3.8-flash-lite-tts", "gemini-3.8-flash-tts"]
 GEMINI_VOICES = ["Kore", "Puck", "Zephyr", "Charon", "Fenrir", "Leda"]
 
@@ -284,7 +284,7 @@ def gemini_stt(key, model, wav_bytes, language, vocab):
         prompt += f" The language is {language.split('(')[0].strip()}."
     if vocab:
         prompt += f" Domain vocabulary and spellings: {vocab}."
-    out = gemini_interact(key, {"model": model, "input": [{"type": "user_input", "content": [{"type": "text", "text": prompt}, {"type": "audio", "data": base64.b64encode(wav_bytes).decode(), "mime_type": "audio/wav"}]}]})
+    out = gemini_interact(key, {"model": model, "input": [{"type": "text", "text": prompt}, {"type": "audio", "data": base64.b64encode(wav_bytes).decode(), "mime_type": "audio/wav"}]})  # flat input list, as in the official audio examples
     blocks = []
     _find_blocks(out.get("steps", out), blocks)
     texts = [b["text"] for b in blocks if b.get("type") == "text" and isinstance(b.get("text"), str)]
@@ -295,13 +295,29 @@ def gemini_tts(key, model, voice, text, tone):
     block = {"type": "text", "text": text}
     if tone:
         block["annotations"] = [{"type": "speech_metadata", "style": tone}]
-    out = gemini_interact(key, {"model": model, "input": [{"type": "user_input", "content": [block]}], "response_format": {"type": "audio"}, "generation_config": {"speech_config": [{"voice": voice}]}})
+    out = gemini_interact(key, {"model": model, "input": [{"type": "user_input", "content": [block]}], "response_format": {"type": "audio", "mime_type": "audio/wav"}, "generation_config": {"speech_config": [{"voice": voice}]}})
     blocks = []
     _find_blocks(out.get("steps", out), blocks)
     for b in blocks:
         if isinstance(b.get("data"), str) and (b.get("type") == "audio" or str(b.get("mime_type", "")).startswith("audio")):
-            return base64.b64decode(b["data"])
-    raise RuntimeError("Gemini TTS returned no audio")
+            return normalize_audio(base64.b64decode(b["data"]), str(b.get("mime_type", "")))
+    raise RuntimeError("Gemini TTS returned no audio block")
+
+
+def normalize_audio(raw, mime=""):
+    """Documented contract: unary TTS returns a complete WAV (RIFF). Headerless audio/l16 (24 kHz mono 16-bit LE) is wrapped into WAV so browsers can play it."""
+    if raw[:4] == b"RIFF":
+        return raw
+    if "l16" in mime.lower() or not mime or mime.lower().startswith("audio/pcm"):
+        m = re.search(r"rate=(\d+)", mime)
+        out = io.BytesIO()
+        with wave.open(out, "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(int(m.group(1)) if m else 24000)
+            w.writeframes(raw)
+        return out.getvalue()
+    raise RuntimeError(f"Unsupported Gemini audio type: {mime or 'unknown'}")
 
 
 def audio_mime(b):
@@ -470,8 +486,6 @@ def stream_chat(key, model, msgs, temp, on_text, tools=None):
             c = calls.setdefault(idx, {"id": "", "type": "function", "function": {"name": "", "arguments": ""}})
             if tc.get("id"):
                 c["id"] = tc["id"]
-            if tc.get("extra_content"):  # keep provider extras (e.g. Gemini thought signatures) so they can be sent back
-                c["extra_content"] = tc["extra_content"]
             c["function"]["name"] += f.get("name") or ""
             c["function"]["arguments"] += f.get("arguments") or ""
     out_calls = [calls[i] for i in sorted(calls)]
@@ -890,7 +904,7 @@ with st.sidebar:
     PROV["name"] = provider
     key = st.text_input(f"{provider} API key", type="password", help="Kept only in this browser session. Leave empty for free mode.", placeholder="AIza..." if provider == "Gemini" else "sk-...")
     if provider == "Gemini":
-        st.warning("Gemini free tier: Google may use what you send (text and audio) to improve its products, and human reviewers may read it. Use dummy phrases, not private data. Paid tier is not used by this app.")
+        st.warning("Gemini free tier: Google may use what you send (text and audio) to improve its products, and human reviewers may read it. Use dummy phrases, not private data. Billing is decided by the Google project that owns your key, not by this app: if that project has billing enabled, requests can be charged at paid rates (and paid-tier data terms apply). This app cannot check or cap that. Use a key from a project without billing if you want to stay free.")
     if not key:
         st.info(f"No key: free mode. Type requests; weather is live, replies are spoken with gTTS. Add a {provider} key for cloud speech-to-text, LLM reasoning and {provider} voices.")
     persona = st.selectbox("Use case / persona", list(PERSONAS))
