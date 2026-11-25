@@ -30,6 +30,9 @@ import uuid
 st.set_page_config(page_title="VoxAgent Studio", page_icon="🎙️", layout="wide")
 
 OPENAI = os.environ.get("VOX_OPENAI_BASE", "https://api.openai.com/v1")  # override only for tests against a mock server
+GEMINI_OAI = os.environ.get("VOX_GEMINI_OAI_BASE", "https://generativelanguage.googleapis.com/v1beta/openai")  # OpenAI-compatible chat endpoint
+GEMINI_NATIVE = os.environ.get("VOX_GEMINI_BASE", "https://generativelanguage.googleapis.com/v1beta")  # native endpoint (audio in, TTS)
+PROV = {"name": "OpenAI"}  # set from the sidebar on every run
 HAS_LOCAL_WHISPER = importlib.util.find_spec("faster_whisper") is not None
 SIMULATED_TOOLS = {"schedule_meeting", "book_restaurant_table", "book_appointment", "create_ticket", "remember"}
 
@@ -74,6 +77,18 @@ FAQ = {
 OPENAI_VOICES = ["coral", "alloy", "ash", "ballad", "echo", "fable", "nova", "onyx", "sage", "shimmer", "verse"]
 STT_MODELS = ["gpt-4o-mini-transcribe", "gpt-4o-transcribe", "whisper-1"]
 LLM_MODELS = ["gpt-4o-mini", "gpt-4.1-mini", "gpt-4o"]
+GEMINI_LLMS = ["gemini-3.8-flash", "gemini-3.6-flash"]
+GEMINI_TTS = ["gemini-3.8-flash-lite-tts", "gemini-3.8-flash-tts"]
+GEMINI_VOICES = ["Kore", "Puck", "Zephyr", "Charon", "Fenrir", "Leda"]
+
+
+def is_gemini():
+    return PROV["name"] == "Gemini"
+
+
+def chat_base():
+    return GEMINI_OAI if is_gemini() else OPENAI
+
 
 # ----------------------------------------------------------------------------- state
 
@@ -179,32 +194,39 @@ BILLING_CODES = {"insufficient_quota", "billing_hard_limit_reached", "organizati
 
 
 def check(r):
-    """Like raise_for_status, but shows OpenAI's own error code/message (keys scrubbed) and what kind of 429 it is."""
+    """Like raise_for_status, but shows the provider's own error code/message (keys scrubbed) and what kind of 429 it is."""
     if r.ok:
         return
+    who = "Gemini" if is_gemini() else "OpenAI"
     code = typ = msg = ""
     try:
-        e = (r.json() or {}).get("error") or {}
-        code, typ, msg = str(e.get("code") or ""), str(e.get("type") or ""), str(e.get("message") or "")
+        body = r.json()
+        if isinstance(body, list) and body:
+            body = body[0]
+        e = (body or {}).get("error") or {}
+        code, typ, msg = str(e.get("code") or ""), str(e.get("type") or e.get("status") or ""), str(e.get("message") or "")
     except Exception:  # noqa: BLE001
         msg = (r.text or "")[:200]
-    msg = re.sub(r"sk-[A-Za-z0-9_\-\*\.]{4,}", "sk-***", msg)[:300]
+    msg = re.sub(r"(sk-|AIza)[A-Za-z0-9_\-\*\.]{4,}", r"\1***", msg)[:300]
     rid = r.headers.get("x-request-id", "")
     hint = ""
     if r.status_code == 429:
-        if code in BILLING_CODES or typ == "insufficient_quota":
+        if who == "Gemini":
+            hint = "Gemini quota or rate limit for this key's Google project (free-tier limits are per minute and per day, per project; daily quota resets at midnight Pacific). Check the rate limits shown in Google AI Studio, wait a minute, or use a different model."
+        elif code in BILLING_CODES or typ == "insufficient_quota":
             hint = "Credit, quota or spend limit reached on the account/project that owns this key. Retrying will not help; check Billing and Limits in the OpenAI dashboard."
         elif code == "rate_limit_exceeded" or typ == "requests":
             hint = "Rate limit (too many requests or tokens per minute). Wait a minute and try once."
         else:
-            hint = "OpenAI returned 429 without a recognised code, so rate limit vs credit limit cannot be told apart from this response."
-    elif r.status_code == 401:
-        hint = "The key was rejected. Check it was copied fully and has not been revoked."
+            hint = "429 without a recognised code, so rate limit vs credit limit cannot be told apart from this response."
+    elif r.status_code in (401, 403):
+        hint = "The key was rejected" + (" or the Generative Language API is not enabled/allowed for it (Gemini)." if who == "Gemini" else ". Check it was copied fully and has not been revoked.")
+    elif r.status_code == 400 and who == "Gemini":
+        hint = "Bad request. Check the model name is available to this key and the request is valid."
     elif r.status_code == 404:
         hint = "Model not available to this key/project."
     ra = r.headers.get("retry-after")
-    raise RuntimeError(f"HTTP {r.status_code} from OpenAI" + (f" | code: {code}" if code else "") + (f" | type: {typ}" if typ else "") + (f" | message: {msg}" if msg else "") + (f" | retry-after: {ra}s" if ra else "") + (f" | request id: {rid}" if rid else "") + (f" | {hint}" if hint else ""))
-
+    raise RuntimeError(f"HTTP {r.status_code} from {who}" + (f" | code: {code}" if code else "") + (f" | type: {typ}" if typ else "") + (f" | message: {msg}" if msg else "") + (f" | retry-after: {ra}s" if ra else "") + (f" | request id: {rid}" if rid else "") + (f" | {hint}" if hint else ""))
 
 
 def headers(key):
@@ -238,6 +260,81 @@ def openai_tts(key, model, voice, speed, text, tone):
     r = requests.post(f"{OPENAI}/audio/speech", headers=headers(key), json=body, timeout=90)
     check(r)
     return r.content
+
+
+def _find_blocks(o, out):
+    if isinstance(o, dict):
+        out.append(o)
+        for v in o.values():
+            _find_blocks(v, out)
+    elif isinstance(o, list):
+        for v in o:
+            _find_blocks(v, out)
+
+
+def gemini_interact(key, body):
+    r = requests.post(f"{GEMINI_NATIVE}/interactions", headers={"x-goog-api-key": key, "Content-Type": "application/json"}, json=body, timeout=120)
+    check(r)
+    return r.json()
+
+
+def gemini_stt(key, model, wav_bytes, language, vocab):
+    prompt = "Generate a verbatim transcript of the speech. Reply with only the transcript text."
+    if language and language != "Auto-detect":
+        prompt += f" The language is {language.split('(')[0].strip()}."
+    if vocab:
+        prompt += f" Domain vocabulary and spellings: {vocab}."
+    out = gemini_interact(key, {"model": model, "input": [{"type": "user_input", "content": [{"type": "text", "text": prompt}, {"type": "audio", "data": base64.b64encode(wav_bytes).decode(), "mime_type": "audio/wav"}]}]})
+    blocks = []
+    _find_blocks(out.get("steps", out), blocks)
+    texts = [b["text"] for b in blocks if b.get("type") == "text" and isinstance(b.get("text"), str)]
+    return (texts[-1] if texts else "").strip()
+
+
+def gemini_tts(key, model, voice, text, tone):
+    block = {"type": "text", "text": text}
+    if tone:
+        block["annotations"] = [{"type": "speech_metadata", "style": tone}]
+    out = gemini_interact(key, {"model": model, "input": [{"type": "user_input", "content": [block]}], "response_format": {"type": "audio"}, "generation_config": {"speech_config": [{"voice": voice}]}})
+    blocks = []
+    _find_blocks(out.get("steps", out), blocks)
+    for b in blocks:
+        if isinstance(b.get("data"), str) and (b.get("type") == "audio" or str(b.get("mime_type", "")).startswith("audio")):
+            return base64.b64decode(b["data"])
+    raise RuntimeError("Gemini TTS returned no audio")
+
+
+def audio_mime(b):
+    return "audio/wav" if b[:4] == b"RIFF" else "audio/mpeg"
+
+
+def join_audio(parts):
+    """Join chunk audio into one file. WAV chunks are merged properly; MP3 chunks are concatenated."""
+    if not parts:
+        return None
+    if all(p[:4] == b"RIFF" for p in parts):
+        try:
+            frames, params = [], None
+            for p in parts:
+                with wave.open(io.BytesIO(p)) as w:
+                    if params is None:
+                        params = w.getparams()
+                    frames.append(w.readframes(w.getnframes()))
+            out = io.BytesIO()
+            with wave.open(out, "wb") as w:
+                w.setparams(params)
+                w.writeframes(b"".join(frames))
+            return out.getvalue()
+        except Exception:  # noqa: BLE001
+            return parts[0]
+    return b"".join(parts)
+
+
+def speak_any(cfg, text, tone):
+    """One TTS call for whichever provider is selected (safe to call from worker threads)."""
+    if cfg.get("provider") == "Gemini":
+        return gemini_tts(cfg["key"], cfg["tts_model"], cfg["voice"], text, tone)
+    return openai_tts(cfg["key"], cfg["tts_model"], cfg["voice"], cfg["speed"], text, tone)
 
 
 def gtts_tts(text):
@@ -288,7 +385,7 @@ class TTSPipeline:
     def _speak(self, text):
         t = time.time()
         if self.cfg["key"]:
-            a = openai_tts(self.cfg["key"], self.cfg["tts_model"], self.cfg["voice"], self.cfg["speed"], text, self.tone)
+            a = speak_any(self.cfg, text, self.tone)
         else:
             a = gtts_tts(text)
         return a, t, time.time()
@@ -349,7 +446,7 @@ def stream_chat(key, model, msgs, temp, on_text, tools=None):
         body["tools"] = tools
     t0 = time.time()
     first = None
-    r = requests.post(f"{OPENAI}/chat/completions", headers=headers(key), json=body, stream=True, timeout=90)
+    r = requests.post(f"{chat_base()}/chat/completions", headers=headers(key), json=body, stream=True, timeout=90)
     check(r)
     content, calls = "", {}
     for line in r.iter_lines(chunk_size=1, decode_unicode=True):
@@ -366,13 +463,22 @@ def stream_chat(key, model, msgs, temp, on_text, tools=None):
             content += d["content"]
             on_text(d["content"])
         for tc in d.get("tool_calls") or []:
-            c = calls.setdefault(tc.get("index", 0), {"id": "", "type": "function", "function": {"name": "", "arguments": ""}})
+            f = tc.get("function", {})
+            idx = tc.get("index")
+            if idx is None:  # Gemini's OpenAI-compatible stream can omit the index: a new name starts a new call
+                idx = (max(calls) + 1 if f.get("name") else max(calls, default=0)) if calls else 0
+            c = calls.setdefault(idx, {"id": "", "type": "function", "function": {"name": "", "arguments": ""}})
             if tc.get("id"):
                 c["id"] = tc["id"]
-            f = tc.get("function", {})
+            if tc.get("extra_content"):  # keep provider extras (e.g. Gemini thought signatures) so they can be sent back
+                c["extra_content"] = tc["extra_content"]
             c["function"]["name"] += f.get("name") or ""
             c["function"]["arguments"] += f.get("arguments") or ""
-    return content, [calls[i] for i in sorted(calls)], first
+    out_calls = [calls[i] for i in sorted(calls)]
+    for n, c in enumerate(out_calls):
+        if not c["id"]:
+            c["id"] = f"call_{n}"
+    return content, out_calls, first
 
 
 # ----------------------------------------------------------------------------- tools
@@ -544,9 +650,11 @@ def llm_intent(key, model, text):
         {"role": "system", "content": "Classify the user utterance. Reply as JSON: {intent: one of get_weather|schedule_meeting|book_restaurant_table|book_appointment|create_ticket|faq|remember|calculate|chitchat, emotion: calm|happy|frustrated|urgent|sad, entities: object, confidence: 0-1}. Today is " + str(date.today()) + "."},
         {"role": "user", "content": text},
     ]
-    r = requests.post(f"{OPENAI}/chat/completions", headers=headers(key), json={"model": model, "messages": msgs, "response_format": {"type": "json_object"}, "temperature": 0}, timeout=60)
+    r = requests.post(f"{chat_base()}/chat/completions", headers=headers(key), json={"model": model, "messages": msgs, "response_format": {"type": "json_object"}, "temperature": 0}, timeout=60)
     check(r)
-    out = json.loads(r.json()["choices"][0]["message"]["content"])
+    raw = (r.json()["choices"][0]["message"]["content"] or "").strip()
+    raw = re.sub(r"^```(?:json)?|```$", "", raw).strip()
+    out = json.loads(raw)
     out["method"] = "llm"
     return out
 
@@ -606,7 +714,7 @@ def offline_reply(text, intent):
         res = run_tool("calculate", {"expression": expr})
         calls.append(("calculate", {"expression": expr}, res))
         return (f"That comes to {res['result']}." if "result" in res else "I could not work that out."), calls
-    return "I can schedule meetings, book tables or appointments, check live weather, answer FAQs and raise tickets. Add an OpenAI key in the sidebar for open-ended conversation.", calls
+    return "I can schedule meetings, book tables or appointments, check live weather, answer FAQs and raise tickets. Add an API key in the sidebar for open-ended conversation.", calls
 
 
 def llm_reply(key, model, persona, history, text, name, intent, temp, mem_turns, pipe, spans):
@@ -684,10 +792,12 @@ def process_turn(cfg, audio_bytes=None, typed=None):
         try:
             if cfg["stt_engine"] == "Whisper (local, free)":
                 text = local_stt(send)
+            elif key and cfg["provider"] == "Gemini":
+                text = gemini_stt(key, cfg["stt_model"], send, cfg["language"], cfg["vocab"])
             elif key:
                 text = openai_stt(key, cfg["stt_model"], send, cfg["language"], cfg["vocab"])
             else:
-                rec["errors"].append("Speech needs an OpenAI key (or local Whisper). Type your request instead, or add a key in the sidebar.")
+                rec["errors"].append("Speech needs an API key (or local Whisper). Type your request instead, or add a key in the sidebar.")
         except ImportError:
             rec["errors"].append("Local Whisper (faster-whisper) is not installed on this server. Use the OpenAI engine with a key, or type.")
         except Exception as e:  # noqa: BLE001
@@ -711,7 +821,7 @@ def process_turn(cfg, audio_bytes=None, typed=None):
     tone = TONES.get(intent.get("emotion", "calm")) if cfg["adaptive"] else None
     pipe = TTSPipeline(cfg, tone, cfg["speak"])
     if cfg["speak"]:
-        pipe.on_ready = lambda i, a: _emit_js(f"P.__vox.add('{tid}',{i},'data:audio/mpeg;base64,{base64.b64encode(a).decode()}');")
+        pipe.on_ready = lambda i, a: _emit_js(f"P.__vox.add('{tid}',{i},'data:{audio_mime(a)};base64,{base64.b64encode(a).decode()}');")
     t = time.time()
     calls, first_token = [], None
     spans = [("Intent & emotion", t - stages["intent"] / 1000, t)]
@@ -742,7 +852,7 @@ def process_turn(cfg, audio_bytes=None, typed=None):
     chunks, terrs = pipe.collect()
     rec["errors"].extend(terrs)
     if chunks:
-        audio = b"".join(c["audio"] for c in chunks)
+        audio = join_audio([c["audio"] for c in chunks])
         stages["tts"] = (max(c["ready"] for c in chunks) - min(c["queued"] for c in chunks)) * 1000
         for c in chunks:
             spans.append((f"TTS chunk {c['chunk']}", c["queued"], c["ready"]))
@@ -776,32 +886,36 @@ st.markdown(
 with st.sidebar:
     st.markdown("## 🎙️ VoxAgent Studio")
     st.markdown("### Control room")
-    key = st.text_input("OpenAI API key", type="password", help="Kept only in this browser session. Leave empty for free mode.", placeholder="sk-...")
+    provider = st.radio("AI provider", ["OpenAI", "Gemini"], horizontal=True, help="Both use your own key, entered below. Never paste a key in chat.")
+    PROV["name"] = provider
+    key = st.text_input(f"{provider} API key", type="password", help="Kept only in this browser session. Leave empty for free mode.", placeholder="AIza..." if provider == "Gemini" else "sk-...")
+    if provider == "Gemini":
+        st.warning("Gemini free tier: Google may use what you send (text and audio) to improve its products, and human reviewers may read it. Use dummy phrases, not private data. Paid tier is not used by this app.")
     if not key:
-        st.info("No key: free mode. Type requests; weather is live, replies are spoken with gTTS. Add a key for cloud speech-to-text, LLM reasoning and OpenAI voices.")
+        st.info(f"No key: free mode. Type requests; weather is live, replies are spoken with gTTS. Add a {provider} key for cloud speech-to-text, LLM reasoning and {provider} voices.")
     persona = st.selectbox("Use case / persona", list(PERSONAS))
     st.caption(PERSONAS[persona]["blurb"])
     name = st.text_input("Your name (personalisation)", placeholder="e.g. Jitendra")
     with st.expander("🎤 Speech-to-Text", expanded=True):
-        engines = ["OpenAI API"] + (["Whisper (local, free)"] if HAS_LOCAL_WHISPER else [])
+        engines = [f"{provider} API"] + (["Whisper (local, free)"] if HAS_LOCAL_WHISPER else [])
         stt_engine = st.radio("Engine", engines)
         if not HAS_LOCAL_WHISPER:
             st.caption("Local Whisper is not available on this hosted app.")
-        stt_model = st.selectbox("Model", STT_MODELS)
+        stt_model = st.selectbox("Model", GEMINI_LLMS if provider == "Gemini" else STT_MODELS, help="Gemini transcribes audio with a general Gemini model (prompted for a transcript)." if provider == "Gemini" else None)
         language = st.selectbox("Language", ["Auto-detect", "English (en)", "Hindi (hi)", "Bengali (bn)", "Spanish (es)", "French (fr)", "German (de)"])
         vocab = st.text_input("Domain vocabulary (spelling hints)", placeholder="Vistra, KYC, ORD-1002, Harbourfront")
     with st.expander("🎚️ Audio front-end"):
         denoise = st.toggle("Noise reduction + normalise", value=True)
         denoise_strength = st.slider("Strength", 0.2, 2.0, 1.0, 0.1)
     with st.expander("🧠 Reasoning"):
-        llm = st.selectbox("LLM", LLM_MODELS)
+        llm = st.selectbox("LLM", GEMINI_LLMS if provider == "Gemini" else LLM_MODELS)
         temp = st.slider("Temperature", 0.0, 1.0, 0.3, 0.05)
         mem_turns = st.slider("Memory (turns)", 1, 12, 6)
     with st.expander("🔊 Text-to-Speech", expanded=True):
         speak = st.toggle("Speak replies", value=True)
-        tts_model = st.selectbox("TTS model", ["gpt-4o-mini-tts", "tts-1"])
-        voice = st.selectbox("Voice", OPENAI_VOICES)
-        speed = st.slider("Speed", 0.7, 1.5, 1.0, 0.05)
+        tts_model = st.selectbox("TTS model", GEMINI_TTS if provider == "Gemini" else ["gpt-4o-mini-tts", "tts-1"])
+        voice = st.selectbox("Voice", GEMINI_VOICES if provider == "Gemini" else OPENAI_VOICES)
+        speed = st.slider("Speed", 0.7, 1.5, 1.0, 0.05, disabled=provider == "Gemini", help="Not used by Gemini TTS." if provider == "Gemini" else None)
         adaptive = st.toggle("Emotion-adaptive tone", value=True, help="Changes delivery (calmer when you sound frustrated). gpt-4o-mini-tts only.")
     if st.button("Reset conversation & world state"):
         for k in ("chat", "turns", "world"):
@@ -809,7 +923,7 @@ with st.sidebar:
         init_state()
         st.rerun()
 
-cfg = dict(key=key.strip(), persona=persona, name=name, stt_engine=stt_engine, stt_model=stt_model, language=language, vocab=vocab, denoise=denoise, denoise_strength=denoise_strength, llm=llm, temp=temp, mem_turns=mem_turns, speak=speak, tts_model=tts_model, voice=voice, speed=speed, adaptive=adaptive)
+cfg = dict(provider=provider, key=key.strip(), persona=persona, name=name, stt_engine=stt_engine, stt_model=stt_model, language=language, vocab=vocab, denoise=denoise, denoise_strength=denoise_strength, llm=llm, temp=temp, mem_turns=mem_turns, speak=speak, tts_model=tts_model, voice=voice, speed=speed, adaptive=adaptive)
 
 tab_studio, tab_rt, tab_lab = st.tabs(["🎙️ Voice Studio", "⚡ Realtime (chunked demo)", "📊 Insights & Lab"])
 
@@ -846,7 +960,7 @@ with tab_studio:
                         st.markdown(f"<span class='pill'>🔧 {m['tool']} · {tag}</span>", unsafe_allow_html=True)
                     st.write(m["text"])
                     if m.get("audio"):
-                        st.audio(m["audio"], format="audio/mp3")
+                        st.audio(m["audio"], format=audio_mime(m["audio"]))
         mode = st.radio("Input", ["🎤 Speak", "📁 Upload audio", "⌨️ Type"], horizontal=True, label_visibility="collapsed", index=2)
         new_audio = None
         typed = None
@@ -953,11 +1067,11 @@ with tab_rt:
     prompt = st.text_input("Prompt", "Explain in three short sentences why latency matters in a voice assistant.", key="rt_prompt")
     if st.button("Run streamed reply"):
         if not key:
-            st.warning("Realtime mode needs an OpenAI key in the sidebar.")
+            st.warning("Realtime mode needs an API key in the sidebar.")
         else:
             t0 = time.time()
             try:
-                r = requests.post(f"{OPENAI}/chat/completions", headers=headers(key), json={"model": llm, "messages": [{"role": "user", "content": prompt + " Plain sentences, no markdown."}], "temperature": temp}, timeout=60)
+                r = requests.post(f"{chat_base()}/chat/completions", headers=headers(key), json={"model": llm, "messages": [{"role": "user", "content": prompt + " Plain sentences, no markdown."}], "temperature": temp}, timeout=60)
                 check(r)
                 full = r.json()["choices"][0]["message"]["content"]
                 t_llm = (time.time() - t0) * 1000
@@ -965,9 +1079,9 @@ with tab_rt:
                 tstart = time.time()
                 for i, sent in enumerate([s for s in re.split(r"(?<=[.!?])\s+", full) if s]):
                     t = time.time()
-                    a = openai_tts(key, tts_model, voice, speed, sent, None)
+                    a = speak_any(cfg, sent, None)
                     rows.append({"chunk": i + 1, "ready_at_s": round(time.time() - t0, 2), "tts_ms": round((time.time() - t) * 1000), "text": sent})
-                    st.audio(a, format="audio/mp3")
+                    st.audio(a, format=audio_mime(a))
                 full_tts = (time.time() - tstart) * 1000
                 st.dataframe(rows, hide_index=True, width="stretch")
                 st.success(f"First audio at {rows[0]['ready_at_s']} s. Waiting for all chunks would have been {(t_llm + full_tts) / 1000:.2f} s.")
