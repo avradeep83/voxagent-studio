@@ -489,6 +489,13 @@ def stream_chat(key, model, msgs, temp, on_text, tools=None):
             c = calls.setdefault(idx, {"id": "", "type": "function", "function": {"name": "", "arguments": ""}})
             if tc.get("id"):
                 c["id"] = tc["id"]
+            if tc.get("extra_content"):  # Gemini 3 thought_signature: must be echoed back on the assistant tool_calls message
+                ec = c.setdefault("extra_content", {})
+                for k, v in tc["extra_content"].items():
+                    if isinstance(v, dict):
+                        ec.setdefault(k, {}).update(v)
+                    else:
+                        ec[k] = v
             c["function"]["name"] += f.get("name") or ""
             c["function"]["arguments"] += f.get("arguments") or ""
     out_calls = [calls[i] for i in sorted(calls)]
@@ -543,6 +550,41 @@ def parse_when(text):
     return str(d), tm
 
 
+_NUMW = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10, "eleven": 11, "twelve": 12}
+
+
+def extract_booking(text):
+    """Exact booking fields from what the user said. Missing ones are None (the caller must ask, never invent)."""
+    t = text.lower()
+    out = {"restaurant": None, "party_size": None, "date": None, "time": None}
+    m = re.search(r"(?:\bparty of|\bfor|\btable of)\s+(\d{1,2}|" + "|".join(_NUMW) + r")\b(?!\s*(?::|[ap]\.?m|o'?clock))", t)
+    if m:
+        out["party_size"] = _NUMW.get(m.group(1)) or int(m.group(1))
+    for m in re.finditer(r"\b(?:at|in|from)\s+(.+?)(?=\s+(?:for|on|tomorrow|today|tonight|this|next|around|by|please|at\s+\d)\b|[.?!]*\s*$)", text, flags=re.I):
+        v = m.group(1).strip(" .,'")
+        if v and not v[0].isdigit() and v.split()[0].lower() not in {"a", "an", "the", "some", "any", "my", "your", "noon", "night", "lunch", "dinner", "breakfast", "the"}:
+            out["restaurant"] = v
+            break
+    low = t
+    if "tomorrow" in low or "today" in low or "tonight" in low or re.search(r"monday|tuesday|wednesday|thursday|friday|saturday|sunday", low):
+        d, _ = parse_when(text)
+        out["date"] = d
+    _, tm = parse_when(text)
+    if not tm:
+        m = re.search(r"\b([01]?\d|2[0-3]):([0-5]\d)\b", t)
+        if m:
+            tm = f"{int(m.group(1)):02d}:{m.group(2)}"
+    if not tm and re.search(r"\bnoon\b", t):
+        tm = "12:00"
+    out["time"] = tm
+    return out
+
+
+def fmt_time(hhmm):
+    h, m = map(int, hhmm.split(":"))
+    return f"{(h % 12) or 12}:{m:02d} {'AM' if h < 12 else 'PM'}"
+
+
 def run_tool(name, args):
     try:
         return _run_tool(name, args)
@@ -563,9 +605,12 @@ def _run_tool(name, args):
         w["calendar"].append(row)
         return {"status": "scheduled", **row}
     if name == "book_restaurant_table":
-        row = {"id": f"RES-{len(w['reservations']) + 1:03d}", "restaurant": args.get("restaurant", "Trattoria Lucca (Italian)"), "party_size": int(args.get("party_size", 2)), "date": args.get("date", str(date.today())), "time": args.get("time", "19:00")}
+        need = [k for k in ("restaurant", "party_size", "date", "time") if not str(args.get(k) or "").strip()]
+        if need:
+            return {"error": "Missing booking details: " + ", ".join(need) + ". Ask the user; never invent them."}
+        row = {"id": f"RES-{len(w['reservations']) + 1:03d}", "restaurant": str(args["restaurant"]).strip(), "party_size": int(args["party_size"]), "date": str(args["date"]), "time": str(args["time"])}
         w["reservations"].append(row)
-        return {"status": "booked", **row}
+        return {"status": "booked (simulated demo, nothing real)", **row}
     if name == "book_appointment":
         row = {"id": f"APT-{len(w['appointments']) + 1:03d}", "service": args.get("service", "General visit"), "date": args.get("date", str(date.today())), "time": args.get("time", "16:00")}
         w["appointments"].append(row)
@@ -602,7 +647,7 @@ S = {"type": "string"}
 TOOLS = [
     fn("get_weather", "Live weather for a city.", {"city": S}, ["city"]),
     fn("schedule_meeting", "Add a calendar meeting. date is YYYY-MM-DD, time is 24h HH:MM.", {"title": S, "date": S, "time": S, "duration_minutes": {"type": "integer"}, "attendees": S}, ["title", "date", "time"]),
-    fn("book_restaurant_table", "Reserve a restaurant table.", {"restaurant": S, "party_size": {"type": "integer"}, "date": S, "time": S}, ["party_size", "time"]),
+    fn("book_restaurant_table", "Reserve a restaurant table. Use EXACTLY the restaurant name and location, party size, date (YYYY-MM-DD) and time (24h HH:MM) the user said. If any is missing or unclear, do not call this tool: ask the user.", {"restaurant": S, "party_size": {"type": "integer"}, "date": S, "time": S}, ["restaurant", "party_size", "date", "time"]),
     fn("book_appointment", "Book an appointment.", {"service": S, "date": S, "time": S}, ["service", "date", "time"]),
     fn("create_ticket", "Create a support ticket.", {"summary": S, "priority": {"type": "string", "enum": ["low", "normal", "high"]}, "order_id": S}, ["summary"]),
     fn("faq", "Answer a policy or FAQ question.", {"question": S}, ["question"]),
@@ -735,12 +780,17 @@ def offline_reply(text, intent):
         calls.append(("schedule_meeting", args, res))
         return (res["error"] if "error" in res else f"Done. I scheduled {args['title']} on {res['date']} at {res['time']}."), calls
     if i == "book_restaurant_table":
-        if "time" not in ent:
-            return "Happy to book it. What time, and for how many people?", calls
-        args = {"party_size": ent.get("party_size", 2), "date": ent["date"], "time": ent["time"], "restaurant": "Trattoria Lucca (Italian)" if "italian" in text.lower() else "Harbourfront Grill"}
+        b = extract_booking(text)
+        labels = {"restaurant": "which restaurant and where", "party_size": "how many people", "date": "which day", "time": "what time"}
+        miss = [labels[k] for k in labels if not b[k]]
+        if miss:
+            return "Happy to book that. I still need " + ", ".join(miss[:-1]) + (" and " if len(miss) > 1 else "") + miss[-1] + ".", calls
+        args = dict(b)
         res = run_tool("book_restaurant_table", args)
         calls.append(("book_restaurant_table", args, res))
-        return f"I have booked a table for {res['party_size']} at {res['time']} at {res['restaurant']}. Let me know if you need anything else.", calls
+        if "error" in res:
+            return res["error"], calls
+        return f"I have booked a table for {res['party_size']} at {res['restaurant']} on {res['date']} at {fmt_time(res['time'])}.", calls
     if i == "book_appointment":
         if "time" not in ent:
             return "Sure. What time works for you?", calls
@@ -775,7 +825,7 @@ def llm_reply(key, model, persona, history, text, name, intent, temp, mem_turns,
     sys = (
         PERSONAS[persona]["system"]
         + f" Today is {date.today()}. The user's name is {name or 'unknown'}. Detected emotion: {intent.get('emotion')}. Replies are spoken aloud: keep them to one to three short sentences, no markdown."
-        + " All booking, calendar, appointment and ticket tools are a simulated demo: when you confirm one, briefly say nothing real was booked."
+        + " All booking, calendar, appointment and ticket tools are a simulated demo: when you confirm one, briefly say nothing real was booked. Use exactly the venue, party size, date and time the user gave; never substitute or invent them, and ask a short question if one is missing."
         + (" Known user preferences: " + "; ".join(st.session_state.world["memory"]) if st.session_state.world["memory"] else "")
     )
     msgs = [{"role": "system", "content": sys}]
