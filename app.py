@@ -539,9 +539,15 @@ def parse_when(text):
     if "tomorrow" in t:
         d += timedelta(days=1)
     for i, name in enumerate(["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]):
-        if name in t:
+        if re.search(r"\b" + name + r"\b", t):
             d += timedelta(days=(i - d.weekday()) % 7 or 7)
             break
+    iso = re.search(r"\b(\d{4})-(\d{2})-(\d{2})\b", t)
+    if iso:
+        try:
+            d = date(int(iso.group(1)), int(iso.group(2)), int(iso.group(3)))
+        except ValueError:
+            pass
     m = re.search(r"(\d{1,2})(?::(\d{2}))?\s*(a\.?m\.?|p\.?m\.?)", t)
     tm = None
     if m:
@@ -560,13 +566,16 @@ def extract_booking(text):
     m = re.search(r"(?:\bparty of|\bfor|\btable of)\s+(\d{1,2}|" + "|".join(_NUMW) + r")\b(?!\s*(?::|[ap]\.?m|o'?clock))", t)
     if m:
         out["party_size"] = _NUMW.get(m.group(1)) or int(m.group(1))
-    for m in re.finditer(r"\b(?:at|in|from)\s+(.+?)(?=\s+(?:for|on|tomorrow|today|tonight|this|next|around|by|please|at\s+\d)\b|[.?!]*\s*$)", text, flags=re.I):
+    vt = re.sub(r"\b(?:at|around|by)?\s*\d{1,2}(?::\d{2})?\s*(?:a\.?m\.?|p\.?m\.?)", " ", text, flags=re.I)
+    vt = re.sub(r"\b\d{4}-\d{2}-\d{2}\b", " ", vt)
+    vt = re.sub(r"\s+", " ", vt).strip()
+    for m in re.finditer(r"\b(?:at|in|from)\s+(.+?)(?=\s+(?:for|on|tomorrow|today|tonight|this|next|around|by|please|at\s+\d)\b|[.?!]*\s*$)", vt, flags=re.I):
         v = m.group(1).strip(" .,'")
         if v and not v[0].isdigit() and v.split()[0].lower() not in {"a", "an", "the", "some", "any", "my", "your", "noon", "night", "lunch", "dinner", "breakfast", "the"}:
             out["restaurant"] = v
             break
     low = t
-    if "tomorrow" in low or "today" in low or "tonight" in low or re.search(r"monday|tuesday|wednesday|thursday|friday|saturday|sunday", low):
+    if "tomorrow" in low or "today" in low or "tonight" in low or re.search(r"\b(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b|\b\d{4}-\d{2}-\d{2}\b", low):
         d, _ = parse_when(text)
         out["date"] = d
     _, tm = parse_when(text)
@@ -583,6 +592,57 @@ def extract_booking(text):
 def fmt_time(hhmm):
     h, m = map(int, hhmm.split(":"))
     return f"{(h % 12) or 12}:{m:02d} {'AM' if h < 12 else 'PM'}"
+
+
+def validate_booking(args):
+    """Return an error string when party size, date or time is not a real value."""
+    try:
+        n = int(args["party_size"])
+    except (TypeError, ValueError):
+        return "Party size must be a whole number."
+    if not 1 <= n <= 50:
+        return "Party size must be between 1 and 50."
+    try:
+        date.fromisoformat(str(args["date"]))
+    except ValueError:
+        return "Date must be a real calendar date (YYYY-MM-DD)."
+    m = re.fullmatch(r"([01]\d|2[0-3]):([0-5]\d)", str(args["time"]))
+    if not m:
+        return "Time must be a real 24-hour time (HH:MM)."
+    return None
+
+
+def safe_calc(expr):
+    """Bounded arithmetic: + - * / ** % with small operands, short input, capped result."""
+    import ast
+    import operator as op
+    if len(expr) > 100:
+        raise ValueError("Expression too long")
+    ops = {ast.Add: op.add, ast.Sub: op.sub, ast.Mult: op.mul, ast.Div: op.truediv, ast.Mod: op.mod, ast.Pow: op.pow, ast.USub: op.neg, ast.UAdd: op.pos}
+    count = [0]
+
+    def ev(n):
+        count[0] += 1
+        if count[0] > 30:
+            raise ValueError("Expression too complex")
+        if isinstance(n, ast.Expression):
+            return ev(n.body)
+        if isinstance(n, ast.Constant) and isinstance(n.value, (int, float)) and not isinstance(n.value, bool):
+            if abs(n.value) > 1e12:
+                raise ValueError("Number too large")
+            return n.value
+        if isinstance(n, ast.UnaryOp) and type(n.op) in ops:
+            return ops[type(n.op)](ev(n.operand))
+        if isinstance(n, ast.BinOp) and type(n.op) in ops:
+            a, b = ev(n.left), ev(n.right)
+            if isinstance(n.op, ast.Pow) and (abs(b) > 64 or abs(a) > 1e6):
+                raise ValueError("Exponent too large")
+            r = ops[type(n.op)](a, b)
+            if abs(r) > 1e18:
+                raise ValueError("Result too large")
+            return r
+        raise ValueError("Unsupported expression")
+    return ev(ast.parse(expr.strip(), mode="eval"))
 
 
 def run_tool(name, args):
@@ -608,6 +668,9 @@ def _run_tool(name, args):
         need = [k for k in ("restaurant", "party_size", "date", "time") if not str(args.get(k) or "").strip()]
         if need:
             return {"error": "Missing booking details: " + ", ".join(need) + ". Ask the user; never invent them."}
+        bad = validate_booking(args)
+        if bad:
+            return {"error": bad}
         row = {"id": f"RES-{len(w['reservations']) + 1:03d}", "restaurant": str(args["restaurant"]).strip(), "party_size": int(args["party_size"]), "date": str(args["date"]), "time": str(args["time"])}
         w["reservations"].append(row)
         return {"status": "booked (simulated demo, nothing real)", **row}
@@ -630,12 +693,10 @@ def _run_tool(name, args):
         return {"status": "saved", "fact": args.get("fact", "")}
     if name == "calculate":
         expr = str(args.get("expression", ""))
-        if re.fullmatch(r"[0-9+\-*/(). %]+", expr):
-            try:
-                return {"result": eval(expr, {"__builtins__": {}}, {})}  # noqa: S307 (charset-restricted)
-            except Exception as e:  # noqa: BLE001
-                return {"error": str(e)}
-        return {"error": "Unsupported expression"}
+        try:
+            return {"result": safe_calc(expr)}
+        except Exception as e:  # noqa: BLE001
+            return {"error": str(e)}
     return {"error": f"Unknown tool {name}"}
 
 
