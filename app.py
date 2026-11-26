@@ -227,7 +227,7 @@ def check(r):
     elif r.status_code == 404:
         hint = "Model not available to this key/project."
     elif r.status_code in (500, 502, 503, 504):
-        hint = ("Temporary overload or outage on the provider's side, not a problem with your key or audio. The app does not retry for you. Wait" + (f" at least {r.headers.get('retry-after')} seconds" if r.headers.get("retry-after") else " a minute") + ", then try once more by hand. If it keeps failing, pick a different model in the sidebar (Speech-to-Text > Model) and retry once.")
+        hint = ("Temporary overload or outage on the provider's side, not a problem with your key or audio. The app does not retry for you. Wait" + (f" at least {r.headers.get('retry-after')} seconds" if r.headers.get("retry-after") else " a minute") + ", then try once more by hand. If it keeps failing, choose a different model for this step in the sidebar and retry once.")
     ra = r.headers.get("retry-after")
     raise RuntimeError(f"HTTP {r.status_code} from {who}" + (f" | code: {code}" if code else "") + (f" | type: {typ}" if typ else "") + (f" | message: {msg}" if msg else "") + (f" | retry-after: {ra}s" if ra else "") + (f" | request id: {rid}" if rid else "") + (f" | {hint}" if hint else ""))
 
@@ -620,6 +620,42 @@ EMO_WORDS = {
 }
 
 
+_CITY_STOP = {"the", "a", "an", "my", "this", "that", "it", "there", "here", "general", "time", "case", "order", "fact", "advance"}
+
+
+def extract_city(text):
+    """Pull a place name out of a weather question. Returns None when there is no clear city (the caller must ask, never guess)."""
+    pat = r"\b(?:in|at|for|of|around|near)\s+([A-Za-z][A-Za-z.'-]*(?:\s+[A-Za-z][A-Za-z.'-]*){0,2}?)(?=\s+(?:right|today|tonight|tomorrow|now|and|or|do|does|will|should|is|be|please|this|next)\b|\s*[?.!,;]|\s*$)"
+    for m in re.finditer(pat, text, flags=re.I):
+        c = m.group(1).strip(" .,'-")
+        if c and c.lower().split()[0] not in _CITY_STOP and not re.fullmatch(r"\d+", c):
+            return c.title()
+    m = re.search(r"\b([A-Z][a-zA-Z]+(?:\s[A-Z][a-zA-Z]+)?)(?:'s)?\s+(?:weather|forecast|temperature)", text)
+    if m and m.group(1).lower() not in {"the", "what", "how", "whats", "today"}:
+        return m.group(1).title()
+    return None
+
+
+def weather_advice(text, res):
+    """Answer only what was asked, from live numbers. Rules, not AI."""
+    t = text.lower()
+    temp, rain = res.get("temperature_c"), res.get("rain_chance_today_pct")
+    wet = (rain is not None and rain >= 40) or (res.get("precipitation_mm") or 0) > 0
+    out = []
+    if re.search(r"umbrella|raincoat|rain gear|\brain\b|raining", t):
+        out.append("Yes, there is a decent chance of rain today, so carry an umbrella." if wet else ("No real chance of rain today, so you do not need an umbrella." if rain is not None else "I could not get the rain chance."))
+    m = re.search(r"(blankets?|jackets?|sweaters?|coats?|hoodies?|woollens?|warm clothes|scarf|shawl)", t)
+    if m and temp is not None:
+        item = m.group(1)
+        if temp <= 15:
+            out.append(f"It is cold at {temp} degrees, so yes, take a {item.rstrip('s')} or something warm.")
+        elif temp <= 22:
+            out.append(f"It is mild at {temp} degrees, so a light layer is enough; a heavy {item.rstrip('s')} is probably not needed.")
+        else:
+            out.append(f"At {temp} degrees you do not need a {item.rstrip('s')}.")
+    return " ".join(out)
+
+
 def heuristic_intent(text):
     t = text.lower()
     emo = "calm"
@@ -635,9 +671,9 @@ def heuristic_intent(text):
     m = re.search(r"(?:for|party of)\s+(\d+|two|three|four|five|six)", t)
     if m:
         ent["party_size"] = {"two": 2, "three": 3, "four": 4, "five": 5, "six": 6}.get(m.group(1)) or int(m.group(1))
-    m = re.search(r"weather (?:in|at|for) ([a-zA-Z ]+?)(?: right| today| now|\?|$|,)", t)
-    if m:
-        ent["city"] = m.group(1).strip().title()
+    city = extract_city(text)
+    if city:
+        ent["city"] = city
     m = re.search(r"ord-\d+", t)
     if m:
         ent["order_id"] = m.group(0).upper()
@@ -682,13 +718,14 @@ def offline_reply(text, intent):
     i = intent["intent"]
     calls = []
     if i == "get_weather":
-        res = run_tool("get_weather", {"city": ent.get("city", "Mumbai")})
-        calls.append(("get_weather", {"city": ent.get("city", "Mumbai")}, res))
+        if not ent.get("city"):
+            return "Which city do you want the weather for? I could not find a place name in your request.", calls
+        res = run_tool("get_weather", {"city": ent["city"]})
+        calls.append(("get_weather", {"city": ent["city"]}, res))
         if "error" in res:
-            return "I could not reach the weather service just now. Please try again in a moment.", calls
-        rain = res.get("rain_chance_today_pct")
-        umb = "" if rain is None else (" There is a decent chance of rain today, so carry an umbrella." if rain >= 40 or res["precipitation_mm"] > 0 else " There is no real chance of rain today, so you do not need an umbrella.")
-        return f"The weather in {res['city']} right now is {res['condition']} at {res['temperature_c']} degrees Celsius.{umb}", calls
+            return (res["error"] if "Could not find" in res["error"] else "I could not reach the weather service just now. Please try again in a moment."), calls
+        adv = weather_advice(text, res)
+        return f"The weather in {res['city']} right now is {res['condition']} at {res['temperature_c']} degrees Celsius." + (" " + adv if adv else ""), calls
     if i == "schedule_meeting":
         if "time" not in ent:
             return "Sure. What time should I schedule it?", calls
@@ -818,7 +855,7 @@ def process_turn(cfg, audio_bytes=None, typed=None):
         except ImportError:
             rec["errors"].append("Local Whisper (faster-whisper) is not installed on this server. Use the OpenAI engine with a key, or type.")
         except Exception as e:  # noqa: BLE001
-            rec["errors"].append(f"Speech-to-text failed: {e}")
+            rec["errors"].append(f"Speech-to-text failed (model {cfg['stt_model']}, set under Speech-to-Text > Model): {e}")
         stages["stt"] = (time.time() - t) * 1000
     if not text:
         st.session_state.turns.append(rec)
@@ -830,7 +867,7 @@ def process_turn(cfg, audio_bytes=None, typed=None):
     try:
         intent = llm_intent(key, cfg["llm"], text) if key else heuristic_intent(text)
     except Exception as e:  # noqa: BLE001
-        rec["errors"].append(f"LLM intent failed, used rules: {e}")
+        rec["errors"].append(f"Intent step failed (model {cfg['llm']}, set under Reasoning > LLM). The answer below uses the rule-based fallback, NOT AI, so it can be wrong: {e}")
         intent = heuristic_intent(text)
     stages["intent"] = (time.time() - t) * 1000
     rec["intent"] = intent
@@ -841,6 +878,7 @@ def process_turn(cfg, audio_bytes=None, typed=None):
         pipe.on_ready = lambda i, a: _emit_js(f"P.__vox.add('{tid}',{i},'data:{audio_mime(a)};base64,{base64.b64encode(a).decode()}');")
     t = time.time()
     calls, first_token = [], None
+    fell_back = False
     spans = [("Intent & emotion", t - stages["intent"] / 1000, t)]
     try:
         if key:
@@ -849,9 +887,12 @@ def process_turn(cfg, audio_bytes=None, typed=None):
             reply, calls = offline_reply(text, intent)
             spans.append(("Reason + act (rules)", t, time.time()))
     except Exception as e:  # noqa: BLE001
-        rec["errors"].append(f"Reasoning failed, used the rule-based fallback: {e}")
+        rec["errors"].append(f"Reasoning step failed (model {cfg['llm']}, set under Reasoning > LLM). The answer below is a rule-based fallback, NOT AI, so it can be wrong: {e}")
+        fell_back = True
         pipe.drop_partial()
         reply, calls = offline_reply(text, intent)
+    if fell_back or not key:
+        reply = "[Rule-based fallback, not AI] " + reply
     if calls and calls[0][0] in SIMULATED_TOOLS and not key and "error" not in calls[-1][2] and calls[-1][0] != "remember":
         reply += " This is a demo, so nothing real was booked."
     t_reason_end = time.time()
